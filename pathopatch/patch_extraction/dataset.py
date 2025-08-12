@@ -68,6 +68,8 @@ class LivePatchWSIConfig(BaseModel):
         annotation_path (str, optional): Path to the .json file with the annotations. Defaults to None.
         label_map_file (str, optional): Path to the .json file with the label map. Defaults to None.
         label_map (dict, optional): Dictionary with the label map. Defaults to None.
+        rois (List[Dict[str, int]], optional): List of regions of interest (ROIs) to process. Each ROI is a dictionary
+            with keys 'x', 'y', 'width', and 'height'. Defaults to None.
         exclude_classes (List[str], optional): List of classes to exclude from the annotation. Defaults to [].
         overlapping_labels (bool, optional): If True, overlapping labels are allowed. Defaults to False.
         store_masks (bool, optional): If True, masks are stored. Defaults to False.
@@ -104,6 +106,7 @@ class LivePatchWSIConfig(BaseModel):
     annotation_path: Optional[str]
     label_map_file: Optional[str]
     label_map: Optional[dict]
+    rois: Optional[List[dict[str, int]]] = None
     exclude_classes: Optional[List[str]] = []
     overlapping_labels: Optional[bool] = False
     store_masks: Optional[bool] = False
@@ -145,6 +148,30 @@ class LivePatchWSIConfig(BaseModel):
         if v < 0 and v > 1:
             raise ValueError("Background ratio must be between 0 and 1")
         return v
+
+    @validator("rois", pre=True, always=True)
+    def validate_rois_disjoint(cls, rois):
+        if rois is None:
+            return rois
+
+        for i, roi1 in enumerate(rois):
+            for j, roi2 in enumerate(rois):
+                if i >= j:
+                    continue  # Avoid duplicate comparisons
+                if cls._rois_overlap(roi1, roi2):
+                    raise ValueError(
+                        f"ROIs at index {i} and {j} overlap: {roi1}, {roi2}"
+                    )
+        return rois
+
+    @staticmethod
+    def _rois_overlap(roi1: dict[str, int], roi2: dict[str, int]) -> bool:
+        """Check if two ROIs overlap."""
+        x1, y1, w1, h1 = roi1["x"], roi1["y"], roi1["width"], roi1["height"]
+        x2, y2, w2, h2 = roi2["x"], roi2["y"], roi2["width"], roi2["height"]
+
+        # Check for overlap
+        return not (x1 + w1 <= x2 or x2 + w2 <= x1 or y1 + h1 <= y2 or y2 + h2 <= y1)
 
     def __post_init_post_parse__(self) -> None:
         if self.label_map_file is None or self.label_map is None:
@@ -686,6 +713,15 @@ class LivePatchWSIDataset(Dataset):
             patch_mask = np.zeros(
                 (self.res_tile_size, self.res_tile_size), dtype=np.uint8
             )
+        elif not self._is_patch_in_rois(row, col):
+            self.logger.info(f"Skipping patch {row}, {col}. No overlap with ROI")
+            discard_patch = True
+            image_tile = None
+            intersected_labels = []  # Zero means background
+            ratio = {}
+            patch_mask = np.zeros(
+                (self.res_tile_size, self.res_tile_size), dtype=np.uint8
+            )
         else:
             intersected_labels, ratio, patch_mask = get_intersected_labels(
                 tile_size=self.res_tile_size,
@@ -738,6 +774,51 @@ class LivePatchWSIDataset(Dataset):
         }
 
         return image_tile, patch_metadata, patch_mask
+
+    def _is_patch_in_rois(self, row: int, col: int) -> bool:
+        """
+        Check if a patch overlaps with any ROI.
+
+        Args:
+            row (int): Row coordinate of the patch.
+            col (int): Column coordinate of the patch.
+
+        Returns:
+            bool: True if the patch overlaps with any ROI, False otherwise.
+        """
+        tile_coords = self.tile_extractor.get_tile_coordinates(
+            self.curr_wsi_level, (col, row)
+        )
+        tile_dims = self.tile_extractor.get_tile_dimensions(
+            self.curr_wsi_level, (col, row)
+        )
+
+        patch_x_coord = tile_coords[0][0]
+        patch_y_coord = tile_coords[0][1]
+        patch_width = tile_dims[0]
+        patch_height = tile_dims[1]
+
+        if not self.config.rois:
+            return True  # If no ROIs are defined, process all patches
+
+        for roi in self.config.rois:
+            roi_x, roi_y, roi_width, roi_height = (
+                roi["x"],
+                roi["y"],
+                roi["width"],
+                roi["height"],
+            )
+
+            # Check if the patch overlaps with the ROI
+            if not (
+                patch_x_coord + patch_width <= roi_x  # Patch left of ROI
+                or patch_x_coord >= roi_x + roi_width  # Patch right of ROI
+                or patch_y_coord + patch_height <= roi_y  # Patch above ROI
+                or patch_y_coord >= roi_y + roi_height  # Patch below ROI
+            ):
+                return True  # Overlaps with this ROI
+
+        return False  # No overlap with any ROI
 
 
 class LivePatchWSIDataloader:
